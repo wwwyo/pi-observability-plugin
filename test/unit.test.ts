@@ -18,7 +18,41 @@ import {
   toChatMlMessage,
   type ChatMlMessage,
   type PiUsage,
+  buildTurnSummary,
 } from "../src/index.ts";
+
+describe("buildTurnSummary", () => {
+  it("folds counts, tool names, errors and per-model usage", () => {
+    const summary = buildTurnSummary({
+      generationCount: 3,
+      toolCallCount: 2,
+      toolNames: { bash: 1, read: 1 },
+      toolErrors: [
+        { name: "bash", status_message: "Tool execution failed", start_time: "2026-01-01T00:00:00.000Z" },
+      ],
+      usageByModel: { "mock-gpt-1": { input: 10, output: 5, total: 15 } },
+    });
+    assert.equal(summary.version, 1);
+    assert.equal(summary.generation_count, 3);
+    assert.equal(summary.tool_call_count, 2);
+    assert.deepEqual(summary.tool_names, { bash: 1, read: 1 });
+    assert.equal(summary.errors[0]?.name, "bash");
+    assert.deepEqual(summary.usage_by_model, { "mock-gpt-1": { input: 10, output: 5, total: 15 } });
+  });
+
+  it("copies, so later mutation of the live state does not leak into the summary", () => {
+    const toolNames: Record<string, number> = { bash: 1 };
+    const summary = buildTurnSummary({
+      generationCount: 0,
+      toolCallCount: 0,
+      toolNames,
+      toolErrors: [],
+      usageByModel: {},
+    });
+    toolNames.bash = 2;
+    assert.deepEqual(summary.tool_names, { bash: 1 });
+  });
+});
 
 describe("createSecretRedactor", () => {
   it("redacts Langfuse key tokens in plain strings", () => {

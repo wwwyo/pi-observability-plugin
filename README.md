@@ -1,4 +1,9 @@
-# Langfuse Observability Plugin for pi
+# Langfuse Observability Plugin for pi (wwwyo fork)
+
+> [!NOTE]
+> Personal fork of [`langfuse/pi-observability-plugin`](https://github.com/langfuse/pi-observability-plugin)
+> that adds an optional compact `detail: turn` mode (see [Turn detail](#turn-detail)).
+> Everything else tracks the upstream plugin.
 
 This extension sends [pi coding agent](https://pi.dev) sessions to
 [Langfuse](https://langfuse.com). It records the user prompts, the agent turns,
@@ -37,13 +42,13 @@ Pi needs Node.js 22.0.0 or newer, and pi's package installer shells out to
 ## Install
 
 ```bash
-pi install npm:@langfuse/pi-observability-plugin
+pi install npm:@wwwyo/pi-observability-plugin
 ```
 
 To try it for a single run, without installing:
 
 ```bash
-pi -e npm:@langfuse/pi-observability-plugin
+pi -e npm:@wwwyo/pi-observability-plugin
 ```
 
 ## Add your Langfuse credentials
@@ -76,7 +81,9 @@ export LANGFUSE_USER_ID="your-user-id"
 ```
 
 Environment variables take precedence over the config file, so you can override
-a single value without editing the file.
+a single value without editing the file. The same file also accepts `detail`
+(see [Turn detail](#turn-detail)); a repo-local `<repo>/.pi/langfuse.json`
+overrides the global file, and the env vars override both.
 
 ## Environment variables
 
@@ -87,8 +94,26 @@ a single value without editing the file.
 | `LANGFUSE_BASE_URL`            | Langfuse host. EU: `https://cloud.langfuse.com`, US: `https://us.cloud.langfuse.com`, Japan: `https://jp.cloud.langfuse.com`, HIPAA: `https://hipaa.cloud.langfuse.com` | No (defaults to EU) |
 | `LANGFUSE_TRACING_ENVIRONMENT` | Environment label for the traces (e.g. `production`)                                                                                              | No                  |
 | `LANGFUSE_USER_ID`             | User ID attached to all traces                                                                                                                    | No                  |
+| `LANGFUSE_PI_DETAIL`           | `full` (default) or `turn`. See [Turn detail](#turn-detail). `LANGFUSE_DETAIL` works as an alias                                          | No                  |
 | `OTEL_SERVICE_NAME`            | OpenTelemetry service name for the exported spans. Unset, OpenTelemetry's own default applies                                                     | No                  |
 | `OTEL_RESOURCE_ATTRIBUTES`     | Extra OpenTelemetry resource attributes as a comma-separated `key=value` list (e.g. `service.namespace=engineering,team.name=platform`). Langfuse shows them under `resourceAttributes` in the trace and observation metadata | No                  |
+
+## Turn detail
+
+Set `"detail": "turn"` in `~/.pi/agent/langfuse.json` to export one observation
+per prompt (the turn root) instead of a root plus every model generation and
+tool call. Override per repo with `"detail": "full"` in
+`<repo>/.pi/langfuse.json`, or per run with `LANGFUSE_PI_DETAIL=full`.
+
+Turn detail keeps the user input and final response, turn timing, context,
+subagent turns, and a versioned `telemetry_summary` JSON value in the turn
+metadata. The summary holds generation/tool counts, tool names, bounded tool
+error messages and times, and token usage grouped by model. It excludes tool
+input/output bodies and intermediate model responses. Failure diagnostics can
+include up to 300 characters of tool output; turn detail reduces volume rather
+than redacting sensitive content. Standard token/cost dashboards, tool-error
+filtering, and individual generation latency views require `full`. Previously
+uploaded turns are not replayed.
 
 ## Enable and disable tracing
 
@@ -97,7 +122,7 @@ a single value without editing the file.
 | One run                 | `LANGFUSE_TRACING_ENABLED=false pi`                         |
 | The current shell       | `export LANGFUSE_TRACING_ENABLED=false` (undo with `unset`) |
 | Global or project scope | `pi config`, then switch the extension off                  |
-| Remove the plugin       | `pi remove npm:@langfuse/pi-observability-plugin`           |
+| Remove the plugin       | `pi remove npm:@wwwyo/pi-observability-plugin`           |
 
 The kill switch has priority over environment keys and the config file. When
 tracing is off, the status line shows `langfuse: off (no keys)` and nothing is
@@ -150,7 +175,7 @@ Remove it again with `pi remove /absolute/path/to/pi-observability-plugin`.
    with the npm CLI:
 
    ```bash
-   npm stage list @langfuse/pi-observability-plugin
+   npm stage list @wwwyo/pi-observability-plugin
    npm stage view <stage-id>
    npm stage approve <stage-id>
    # Or: npm stage reject <stage-id>

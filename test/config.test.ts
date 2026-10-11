@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -14,6 +14,8 @@ const CONFIG_VARS = [
   "LANGFUSE_TRACING_ENVIRONMENT",
   "LANGFUSE_RELEASE",
   "LANGFUSE_TRACING_ENABLED",
+  "LANGFUSE_PI_DETAIL",
+  "LANGFUSE_DETAIL",
   "PI_CODING_AGENT_DIR",
 ];
 
@@ -98,5 +100,34 @@ describe("loadConfig", () => {
     const config = loadConfig();
     assert.equal(config?.userId, undefined);
     assert.equal(config?.environment, undefined);
+  });
+
+  it("defaults detail to full", () => {
+    process.env.LANGFUSE_PUBLIC_KEY = "pk-lf-env";
+    process.env.LANGFUSE_SECRET_KEY = "sk-lf-env";
+    assert.equal(loadConfig()?.detail, "full");
+  });
+
+  it("reads detail from the config file, with the env override winning", () => {
+    writeConfigFile({ publicKey: "pk-lf-file", secretKey: "sk-lf-file", detail: "turn" });
+    assert.equal(loadConfig()?.detail, "turn");
+    process.env.LANGFUSE_PI_DETAIL = "full";
+    assert.equal(loadConfig()?.detail, "full");
+    delete process.env.LANGFUSE_PI_DETAIL;
+    process.env.LANGFUSE_DETAIL = "FULL"; // alias, normalized
+    assert.equal(loadConfig()?.detail, "full");
+  });
+
+  it("lets a repo-local .pi/langfuse.json override the global detail", () => {
+    writeConfigFile({ publicKey: "pk-lf-file", secretKey: "sk-lf-file", detail: "full" });
+    const repo = mkdtempSync(join(tmpdir(), "pi-lf-repo-"));
+    mkdirSync(join(repo, ".pi"));
+    writeFileSync(join(repo, ".pi", "langfuse.json"), JSON.stringify({ detail: "turn" }));
+    assert.equal(loadConfig({ cwd: repo })?.detail, "turn");
+  });
+
+  it("ignores an unknown detail value", () => {
+    writeConfigFile({ publicKey: "pk-lf-file", secretKey: "sk-lf-file", detail: "verbose" });
+    assert.equal(loadConfig()?.detail, "full");
   });
 });

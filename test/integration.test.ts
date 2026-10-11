@@ -136,7 +136,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       // Self identification
       const metadata = (k: string) => root.attrs[`langfuse.observation.metadata.${k}`];
       assert.equal(metadata("source"), "pi");
-      assert.equal(metadata("extension"), "@langfuse/pi-observability-plugin");
+      assert.equal(metadata("extension"), "@wwwyo/pi-observability-plugin");
       // OTLP JSON serializes numbers/booleans in metadata as strings.
       assert.equal(Number(metadata("turn_number")), 1);
 
@@ -257,6 +257,66 @@ describe("integration: pi -> extension -> Langfuse export", () => {
 
       const root = findSpansByName(spans, "Conversational Turn")[0];
       assert.equal(root!.attrs["langfuse.observation.level"], "ERROR", "root reflects that the turn saw an error");
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("turn detail: one observation per turn with a telemetry_summary", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "Explore this project and summarize it", {
+        env: { ...buildLangfuseEnv(capture), LANGFUSE_PI_DETAIL: "turn" },
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+      const spans = capture.spans();
+
+      const roots = findSpansByName(spans, "Conversational Turn");
+      assert.equal(roots.length, 1);
+      const root = roots[0]!;
+      const tree = spans.filter((s) => s.traceId === root.traceId);
+      assert.equal(tree.length, 1, "turn detail must export only the turn root");
+      assert.equal(findSpansByName(tree, "LLM Call").length, 0);
+      assert.equal(tree.filter((s) => s.name.startsWith("Tool: ")).length, 0);
+
+      // The root still carries the user input and the final answer.
+      assert.ok(root.attrs["langfuse.observation.input"], "turn detail keeps the user input");
+      assert.ok(root.attrs["langfuse.observation.output"], "turn detail keeps the final answer");
+
+      const raw = root.attrs["langfuse.observation.metadata.telemetry_summary"];
+      assert.ok(raw, "telemetry_summary must be present in turn detail");
+      const summary = JSON.parse(String(raw));
+      assert.equal(summary.version, 1);
+      assert.equal(summary.generation_count, 3);
+      assert.equal(summary.tool_call_count, 2);
+      assert.deepEqual(summary.tool_names, { bash: 1, read: 1 });
+      assert.deepEqual(summary.errors, []);
+      assert.ok(summary.usage_by_model["mock-gpt-1"], "usage must be grouped by model");
+    } finally {
+      capture.close();
+    }
+  });
+
+  it("turn detail: records bounded tool errors in the summary", async () => {
+    const capture = await startCaptureServer();
+    try {
+      const sandbox = createSandbox(mock.port);
+      const result = await runPi(sandbox, "[fail] read the log file", {
+        env: { ...buildLangfuseEnv(capture), LANGFUSE_PI_DETAIL: "turn" },
+      });
+      assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
+      await waitForRequests(capture, 1);
+      const root = findSpansByName(capture.spans(), "Conversational Turn")[0]!;
+      assert.equal(root.attrs["langfuse.observation.level"], "ERROR");
+      const summary = JSON.parse(
+        String(root.attrs["langfuse.observation.metadata.telemetry_summary"]),
+      );
+      assert.equal(summary.tool_call_count, 1);
+      assert.equal(summary.errors.length, 1);
+      assert.equal(summary.errors[0].name, "bash");
+      assert.match(summary.errors[0].status_message, /failed/i);
     } finally {
       capture.close();
     }

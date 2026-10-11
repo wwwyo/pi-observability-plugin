@@ -20,8 +20,8 @@ import { type SpanContext, TraceFlags } from "@opentelemetry/api";
 import { defaultResource, detectResources, envDetector } from "@opentelemetry/resources";
 import { AlwaysOnSampler, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
-const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
-const EXTENSION_VERSION = "0.1.2";
+const EXTENSION_NAME = "@wwwyo/pi-observability-plugin";
+const EXTENSION_VERSION = "0.2.0";
 const ROOT_OBSERVATION_NAME = "Conversational Turn";
 const SUBAGENT_ROOT_OBSERVATION_NAME = "Subagent Turn";
 const TRACE_NAME = "Pi Turn";
@@ -111,6 +111,8 @@ function readParentIds(env: NodeJS.ProcessEnv): ParentIds | undefined {
 // Config
 // ---------------------------------------------------------------------------
 
+export type DetailLevel = "full" | "turn";
+
 export interface LangfuseConfig {
   publicKey: string;
   secretKey: string;
@@ -118,44 +120,91 @@ export interface LangfuseConfig {
   userId?: string;
   environment?: string;
   release?: string;
+  /**
+   * `turn` keeps one observation per prompt and folds the child generations and
+   * tool calls into a versioned `telemetry_summary` in the turn metadata.
+   * Defaults to `full` (individual spans), mirroring the Codex plugin.
+   */
+  detail: DetailLevel;
 }
 
-export function loadConfig(): LangfuseConfig | undefined {
+export interface ConfigOptions {
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+}
+
+const DEFAULT_DETAIL: DetailLevel = "full";
+
+function asDetail(value: unknown): DetailLevel | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "turn" || normalized === "full" ? normalized : undefined;
+}
+
+export function loadConfig(options: ConfigOptions = {}): LangfuseConfig | undefined {
+  const env = options.env ?? process.env;
+  const cwd = options.cwd ?? process.cwd();
   // Kill switch: wins over both env keys and the config file.
-  if ((process.env.LANGFUSE_TRACING_ENABLED ?? "").trim().toLowerCase() === "false") {
+  if ((env.LANGFUSE_TRACING_ENABLED ?? "").trim().toLowerCase() === "false") {
     return undefined;
   }
-  const file = readConfigFile();
+  // Global (`<agentDir>/langfuse.json`) then repo-local (`<cwd>/.pi/langfuse.json`),
+  // mirroring the Codex plugin. Env vars win over both.
+  const globalFile = readConfigFile(join(getAgentDir(), "langfuse.json"));
+  const localFile = readConfigFile(join(cwd, ".pi", "langfuse.json"));
   const asTrimmedString = (v: unknown): string | undefined =>
     typeof v === "string" && v.trim() ? v.trim() : undefined;
 
-  const publicKey = process.env.LANGFUSE_PUBLIC_KEY?.trim() || asTrimmedString(file.publicKey);
-  const secretKey = process.env.LANGFUSE_SECRET_KEY?.trim() || asTrimmedString(file.secretKey);
+  const publicKey =
+    env.LANGFUSE_PUBLIC_KEY?.trim() ||
+    asTrimmedString(globalFile.publicKey) ||
+    asTrimmedString(localFile.publicKey);
+  const secretKey =
+    env.LANGFUSE_SECRET_KEY?.trim() ||
+    asTrimmedString(globalFile.secretKey) ||
+    asTrimmedString(localFile.secretKey);
   if (!publicKey || !secretKey) return undefined;
   const baseUrl =
-    process.env.LANGFUSE_BASE_URL?.trim() ||
-    process.env.LANGFUSE_HOST?.trim() ||
-    asTrimmedString(file.baseUrl) ||
+    env.LANGFUSE_BASE_URL?.trim() ||
+    env.LANGFUSE_HOST?.trim() ||
+    asTrimmedString(globalFile.baseUrl) ||
+    asTrimmedString(localFile.baseUrl) ||
     "https://cloud.langfuse.com";
+  // detail precedence: env > repo-local > global > default (Codex parity).
+  const detail =
+    asDetail(env.LANGFUSE_PI_DETAIL) ??
+    asDetail(env.LANGFUSE_DETAIL) ??
+    asDetail(localFile.detail) ??
+    asDetail(globalFile.detail) ??
+    DEFAULT_DETAIL;
   return {
     publicKey,
     secretKey,
     baseUrl: baseUrl.replace(/\/$/, ""),
-    userId: process.env.LANGFUSE_USER_ID?.trim() || asTrimmedString(file.userId),
-    environment: process.env.LANGFUSE_TRACING_ENVIRONMENT?.trim() || asTrimmedString(file.environment),
-    release: process.env.LANGFUSE_RELEASE?.trim() || asTrimmedString(file.release),
+    userId:
+      env.LANGFUSE_USER_ID?.trim() ||
+      asTrimmedString(globalFile.userId) ||
+      asTrimmedString(localFile.userId),
+    environment:
+      env.LANGFUSE_TRACING_ENVIRONMENT?.trim() ||
+      asTrimmedString(globalFile.environment) ||
+      asTrimmedString(localFile.environment),
+    release:
+      env.LANGFUSE_RELEASE?.trim() ||
+      asTrimmedString(globalFile.release) ||
+      asTrimmedString(localFile.release),
+    detail,
   };
 }
 
-function readConfigFile(): Partial<Record<keyof LangfuseConfig, unknown>> {
+function readConfigFile(path: string): Partial<Record<keyof LangfuseConfig, unknown>> {
   try {
-    const path = join(getAgentDir(), "langfuse.json");
     if (!existsSync(path)) return {};
     const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
     return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
   } catch (error) {
     console.error(
-      `[pi-langfuse] Ignoring unreadable langfuse.json: ${(error as Error).message}`,
+      `[pi-langfuse] Ignoring unreadable ${path}: ${(error as Error).message}`,
     );
     return {};
   }
@@ -595,6 +644,68 @@ export function buildCostDetails(usage: PiUsage): Record<string, number> | undef
 }
 
 // ---------------------------------------------------------------------------
+// Turn detail (compact mode)
+// ---------------------------------------------------------------------------
+
+/**
+ * Versioned per-turn aggregate written to `telemetry_summary` in turn metadata.
+ * The shape matches the Codex plugin and the version the session evaluator reads
+ * (it requires `version: 1` plus the two integer counts, `tool_names` and
+ * `errors`). `usage_by_model` is informational and uses the plugin's usage key
+ * spellings plus `total`.
+ */
+export interface TurnSummary {
+  version: 1;
+  generation_count: number;
+  tool_call_count: number;
+  tool_names: Record<string, number>;
+  errors: Array<{ name: string; status_message: string; start_time: string }>;
+  usage_by_model: Record<string, Record<string, number>>;
+}
+
+export function buildTurnSummary(state: {
+  generationCount: number;
+  toolCallCount: number;
+  toolNames: Record<string, number>;
+  toolErrors: Array<{ name: string; status_message: string; start_time: string }>;
+  usageByModel: Record<string, Record<string, number>>;
+}): TurnSummary {
+  return {
+    version: 1,
+    generation_count: state.generationCount,
+    tool_call_count: state.toolCallCount,
+    tool_names: { ...state.toolNames },
+    errors: state.toolErrors.map((error) => ({ ...error })),
+    usage_by_model: Object.fromEntries(
+      Object.entries(state.usageByModel).map(([model, totals]) => [model, { ...totals }]),
+    ),
+  };
+}
+
+/** Adds one generation's usage into the per-model totals used by turn detail. */
+function addUsage(
+  usageByModel: Record<string, Record<string, number>>,
+  model: string,
+  usage: PiUsage | undefined,
+): void {
+  const details = usage ? buildUsageDetails(usage) : undefined;
+  if (!details) return;
+  const totals = (usageByModel[model] ??= {});
+  for (const [key, value] of Object.entries(details)) {
+    totals[key] = (totals[key] ?? 0) + value;
+  }
+  // `input` already excludes the cache buckets and `output` excludes a split
+  // reasoning count, so the exclusive buckets sum to the turn total.
+  const total =
+    (details.input ?? 0) +
+    (details.output ?? 0) +
+    (details.output_reasoning_tokens ?? 0) +
+    (details.cache_read_input_tokens ?? 0) +
+    (details.cache_creation_input_tokens ?? 0);
+  totals.total = (totals.total ?? 0) + total;
+}
+
+// ---------------------------------------------------------------------------
 // Runtime (isolated OTEL provider — never touches the global provider)
 // ---------------------------------------------------------------------------
 
@@ -654,18 +765,29 @@ interface OpenGeneration {
   finished: boolean;
 }
 
+interface OpenTool {
+  obs?: LangfuseTool;
+  name: string;
+  startedAt: Date;
+}
+
 interface PromptState {
   root: LangfuseSpan;
   turnNumber: number;
   generationCount: number;
   openGeneration?: OpenGeneration;
-  openTools: Map<string, { obs: LangfuseTool; name: string; startedAt: Date }>;
+  openTools: Map<string, OpenTool>;
   pendingToolResults: Array<{ tool_call_id: string; name: string; content: string }>;
   lastAssistantText?: string;
   sawError: boolean;
   userText: string;
   turnImages: PiImagePart[];
   systemPrompt?: string;
+  // Turn-detail aggregation. Populated only when config.detail === "turn".
+  toolCallCount: number;
+  toolNames: Record<string, number>;
+  toolErrors: Array<{ name: string; status_message: string; start_time: string }>;
+  usageByModel: Record<string, Record<string, number>>;
 }
 
 const DEBUG = process.env.PI_LANGFUSE_DEBUG === "true";
@@ -736,6 +858,7 @@ export default function (pi: ExtensionAPI) {
   const closeDanglingObservations = (reason: "interrupted" | "superseded") => {
     if (!state) return;
     for (const [, tool] of state.openTools) {
+      if (!tool.obs) continue;
       tool.obs.update({ level: "WARNING", statusMessage: `Tool run ${reason}`, metadata: { [reason]: true } });
       tool.obs.end();
     }
@@ -786,6 +909,9 @@ export default function (pi: ExtensionAPI) {
       metadata: {
         ...(state.turnImages.length ? { image_count: state.turnImages.length } : {}),
         ...(opts.cancelled ? { cancelled: true } : {}),
+        ...(config.detail === "turn"
+          ? { telemetry_summary: JSON.stringify(buildTurnSummary(state)) }
+          : {}),
       },
     });
     state.root.end();
@@ -889,6 +1015,10 @@ export default function (pi: ExtensionAPI) {
       sawError: false,
       userText,
       turnImages: [...promptImages],
+      toolCallCount: 0,
+      toolNames: {},
+      toolErrors: [],
+      usageByModel: {},
     };
     publishParentContext(root, sessionId);
     debug("root created, turn", turnNumber);
@@ -918,6 +1048,9 @@ export default function (pi: ExtensionAPI) {
       gen.obs.end();
     }
     const index = ++state.generationCount;
+    // Turn detail: one observation per prompt. Child generations are folded
+    // into the turn's telemetry_summary instead of exported individually.
+    if (config.detail === "turn") return;
     const history = lastContextHistory;
     const baseInput: unknown[] =
       history ??
@@ -979,14 +1112,26 @@ export default function (pi: ExtensionAPI) {
       usage?: PiUsage;
     };
     if (message.role !== "assistant") return;
-    const gen = state.openGeneration;
-    if (!gen || gen.finished) return;
 
     const text = extractText(message.content);
     const tools = extractToolCalls(message.content);
     const thinking = extractThinking(message.content);
     const isError = message.stopReason === "error" || message.stopReason === "aborted";
     if (message.stopReason === "error") state.sawError = true;
+
+    if (config.detail === "turn") {
+      addUsage(
+        state.usageByModel,
+        message.responseModel || message.model || "unknown",
+        message.usage,
+      );
+      if (text) state.lastAssistantText = text;
+      state.pendingToolResults = [];
+      return;
+    }
+
+    const gen = state.openGeneration;
+    if (!gen || gen.finished) return;
 
     gen.obs.update({
       output: {
@@ -1024,6 +1169,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_start", (event) => {
     if (!state) return;
+    const startedAt = new Date();
+    if (config.detail === "turn") {
+      const name = event.toolName || "tool";
+      state.toolCallCount += 1;
+      state.toolNames[name] = (state.toolNames[name] ?? 0) + 1;
+      state.openTools.set(event.toolCallId, { name, startedAt });
+      return;
+    }
     const redactedArgs = redactLangfuseKeys(event.args) as Record<string, unknown>;
     const serializedArgs = safeStringify(redactedArgs);
     const hasDataUri = /data:[^;,]{0,100};base64,/.test(serializedArgs);
@@ -1045,7 +1198,7 @@ export default function (pi: ExtensionAPI) {
       },
       { asType: "tool" },
     );
-    state.openTools.set(event.toolCallId, { obs, name: event.toolName, startedAt: new Date() });
+    state.openTools.set(event.toolCallId, { obs, name: event.toolName, startedAt });
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
@@ -1059,6 +1212,20 @@ export default function (pi: ExtensionAPI) {
     const rawOutput = renderContentWithImageMarkers(result?.content) || safeStringify(result?.content);
     if (event.isError) state.sawError = true;
     state.turnImages.push(...images);
+
+    if (config.detail === "turn") {
+      if (event.isError) {
+        state.toolErrors.push({
+          name: open.name || "tool",
+          status_message: "Tool execution failed",
+          start_time: open.startedAt.toISOString(),
+        });
+      }
+      return;
+    }
+
+    const obs = open.obs;
+    if (!obs) return; // full mode always records tool spans
 
     if (result?.usage) {
       const usageObs = startObservation(
@@ -1080,7 +1247,7 @@ export default function (pi: ExtensionAPI) {
         },
         {
           asType: "generation",
-          parentSpanContext: open.obs.otelSpan.spanContext(),
+          parentSpanContext: obs.otelSpan.spanContext(),
           startTime: open.startedAt,
         },
       );
@@ -1088,7 +1255,7 @@ export default function (pi: ExtensionAPI) {
       debug("tool result usage traced", open.name, result.usage.input, result.usage.output);
     }
 
-    open.obs.update({
+    obs.update({
       output: rawOutput || undefined,
       ...(event.isError ? { level: "ERROR" as const, statusMessage: "Tool execution failed" } : {}),
       metadata: {
@@ -1096,7 +1263,7 @@ export default function (pi: ExtensionAPI) {
         ...(images.length ? { image_count: images.length } : {}),
       },
     });
-    open.obs.end();
+    obs.end();
 
     state.pendingToolResults.push({
       tool_call_id: event.toolCallId,
@@ -1117,6 +1284,7 @@ export default function (pi: ExtensionAPI) {
     },
     startedAt?: Date,
   ): void => {
+    if (config.detail === "turn") return; // turn detail exports no child generations
     if (state) {
       const obs = startObservation(name, attributes, {
         asType: "generation",
